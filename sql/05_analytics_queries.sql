@@ -1,0 +1,139 @@
+-- =============================================================================
+-- File: 05_analytics_queries.sql
+-- Schema: RETAIL_DW
+-- Purpose: Production SQL Analytics & Interview Showcase Queries
+--          (CTEs, Window Functions, Ranking, MoM/DoD Growth, ABC, RFM, DQ)
+-- =============================================================================
+
+-- 1. Executive Revenue & Profit Summary by Store + Channel Rank
+WITH store_perf AS (
+    SELECT
+        s.STORE_CODE,
+        s.STORE_NAME,
+        s.REGION,
+        s.STORE_CHANNEL,
+        COUNT(f.SALES_KEY) AS TXN_COUNT,
+        SUM(f.QUANTITY)    AS UNITS_SOLD,
+        SUM(f.NET_AMOUNT)  AS NET_REVENUE,
+        SUM(f.PROFIT_AMOUNT) AS TOTAL_PROFIT
+    FROM FACT_SALES f
+    JOIN DIM_STORE s ON f.STORE_KEY = s.STORE_KEY
+    GROUP BY s.STORE_CODE, s.STORE_NAME, s.REGION, s.STORE_CHANNEL
+)
+SELECT
+    STORE_CODE,
+    STORE_NAME,
+    REGION,
+    STORE_CHANNEL,
+    TXN_COUNT,
+    UNITS_SOLD,
+    NET_REVENUE,
+    TOTAL_PROFIT,
+    ROUND((TOTAL_PROFIT / NULLIF(NET_REVENUE, 0)) * 100, 2) AS MARGIN_PCT,
+    RANK() OVER (ORDER BY NET_REVENUE DESC) AS REVENUE_RANK,
+    ROUND(RATIO_TO_REPORT(NET_REVENUE) OVER () * 100, 2) AS REVENUE_SHARE_PCT
+FROM store_perf
+ORDER BY REVENUE_RANK;
+
+-- 2. Daily Revenue Running Total & Day-over-Day Growth (LAG + Window Sum)
+WITH daily_sales AS (
+    SELECT
+        d.FULL_DATE AS SALE_DATE,
+        COUNT(f.SALES_KEY) AS TXN_COUNT,
+        SUM(f.NET_AMOUNT)  AS DAILY_REVENUE,
+        SUM(f.PROFIT_AMOUNT) AS DAILY_PROFIT
+    FROM FACT_SALES f
+    JOIN DIM_DATE d ON f.DATE_KEY = d.DATE_KEY
+    GROUP BY d.FULL_DATE
+)
+SELECT
+    SALE_DATE,
+    TXN_COUNT,
+    DAILY_REVENUE,
+    DAILY_PROFIT,
+    SUM(DAILY_REVENUE) OVER (ORDER BY SALE_DATE ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CUMULATIVE_REVENUE,
+    LAG(DAILY_REVENUE) OVER (ORDER BY SALE_DATE) AS PREV_DAY_REVENUE,
+    ROUND(
+        ((DAILY_REVENUE - LAG(DAILY_REVENUE) OVER (ORDER BY SALE_DATE))
+        / NULLIF(LAG(DAILY_REVENUE) OVER (ORDER BY SALE_DATE), 0)) * 100,
+        2
+    ) AS DOD_GROWTH_PCT
+FROM daily_sales
+ORDER BY SALE_DATE;
+
+-- 3. Product ABC (Pareto) Classification by Cumulative Revenue Share
+WITH product_rev AS (
+    SELECT
+        p.PRODUCT_CODE,
+        p.PRODUCT_NAME,
+        p.CATEGORY,
+        SUM(f.QUANTITY)   AS UNITS_SOLD,
+        SUM(f.NET_AMOUNT) AS NET_REVENUE
+    FROM FACT_SALES f
+    JOIN DIM_PRODUCT p ON f.PRODUCT_KEY = p.PRODUCT_KEY
+    GROUP BY p.PRODUCT_CODE, p.PRODUCT_NAME, p.CATEGORY
+),
+pareto AS (
+    SELECT
+        PRODUCT_CODE,
+        PRODUCT_NAME,
+        CATEGORY,
+        UNITS_SOLD,
+        NET_REVENUE,
+        SUM(NET_REVENUE) OVER (ORDER BY NET_REVENUE DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            / NULLIF(SUM(NET_REVENUE) OVER (), 0) AS CUM_REV_RATIO
+    FROM product_rev
+)
+SELECT
+    PRODUCT_CODE,
+    PRODUCT_NAME,
+    CATEGORY,
+    UNITS_SOLD,
+    NET_REVENUE,
+    ROUND(CUM_REV_RATIO * 100, 2) AS CUMULATIVE_REV_PCT,
+    CASE
+        WHEN CUM_REV_RATIO <= 0.70 THEN 'A - Core Revenue Driver'
+        WHEN CUM_REV_RATIO <= 0.90 THEN 'B - Moderate Contributor'
+        ELSE 'C - Long Tail'
+    END AS ABC_CLASS
+FROM pareto
+ORDER BY NET_REVENUE DESC;
+
+-- 4. Customer RFM (Recency, Frequency, Monetary) Value Tiering
+WITH max_dt AS (
+    SELECT MAX(FULL_DATE) AS REF_DATE
+    FROM DIM_DATE d
+    JOIN FACT_SALES f ON f.DATE_KEY = d.DATE_KEY
+),
+cust_metrics AS (
+    SELECT
+        c.CUSTOMER_CODE,
+        c.CUSTOMER_NAME,
+        c.CUSTOMER_SEGMENT,
+        (SELECT REF_DATE FROM max_dt) - MAX(d.FULL_DATE) AS RECENCY_DAYS,
+        COUNT(f.SALES_KEY) AS FREQUENCY,
+        SUM(f.NET_AMOUNT)  AS MONETARY
+    FROM FACT_SALES f
+    JOIN DIM_CUSTOMER c ON f.CUSTOMER_KEY = c.CUSTOMER_KEY
+    JOIN DIM_DATE d     ON f.DATE_KEY     = d.DATE_KEY
+    GROUP BY c.CUSTOMER_CODE, c.CUSTOMER_NAME, c.CUSTOMER_SEGMENT
+)
+SELECT
+    CUSTOMER_CODE,
+    CUSTOMER_NAME,
+    CUSTOMER_SEGMENT,
+    RECENCY_DAYS,
+    FREQUENCY,
+    MONETARY,
+    NTILE(3) OVER (ORDER BY MONETARY DESC) AS VALUE_TIER
+FROM cust_metrics
+ORDER BY MONETARY DESC;
+
+-- 5. Data Quality & Reject Root-Cause Breakdown
+SELECT
+    REJECTION_REASON,
+    COUNT(*) AS REJECT_COUNT,
+    ROUND(RATIO_TO_REPORT(COUNT(*)) OVER () * 100, 2) AS PCT_OF_REJECTS
+FROM STG_SALES_REJECTS
+GROUP BY REJECTION_REASON
+ORDER BY REJECT_COUNT DESC;

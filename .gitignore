@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+logs/
+*.log
+.pytest_cache/
+data/raw/*.csv
+data/api_feed/*.json
+data/archive/*
+data/rejected/*.csv
+data/reports/*.md
+data/reports/*.csv
